@@ -1,29 +1,25 @@
-from .twitch import __check_cache, __cache, wait, __headers
 import socket
 import time
 import threading
 import functools
 import re
 import queue
-import aiohttp
 import ssl
-from . import follows
+import sys
+import traceback
 from datetime import datetime
 
-VIEWERS_URL = 'https://tmi.twitch.tv/group/user/{}/chatters'
 
-
-class ChatUserLevel:
+class Badges:
     none = 0
-    viewer = 1 << 0
-    mod = 1 << 1
-    sub = 1 << 2
-    owner = 1 << 3
+    moderator = 1 << 1
+    subscriber = 1 << 2
+    broadcaster = 1 << 3
     staff = 1 << 4
     admin = 1 << 5
     global_mod = 1 << 6
-    follower = 1 << 7
-    any = viewer | mod | sub | owner | staff | admin | global_mod | follower
+    turbo = 1 << 7
+    premium = 1 << 8
 
 
 class ChatMode:
@@ -33,38 +29,9 @@ class ChatMode:
     r9k = 1 << 2
     host = 1 << 3
 
-async def get_chatters_in_channel(channel, force_refresh=False):
-    if channel[0] == '#':
-        channel = channel[1:]
-    cache_key = ('get_chatters_in_channel', channel)
-
-    if not force_refresh:
-        cached = __check_cache(cache_key)
-        if cached:
-            return cached
-
-    users = None
-    try:
-        res = await aiohttp.request('get', VIEWERS_URL.format(channel), headers=__headers)
-
-        if res.status == 200:
-            js = await res.json()
-
-            if js:
-                users = {}
-                for key, value in js['chatters'].items():
-                    users[key] = set(value)
-                __cache[cache_key] = users, time.time()
-        else:
-            res.close()
-    except Exception:
-        pass
-    finally:
-        return users
-
 
 class TwitchIRCBot:
-    CHAT_SERVER_HOSTNAME = 'chat.twitch.tv'
+    CHAT_SERVER_HOSTNAME = 'irc-ws.chat.twitch.tv'
     MESSAGE_LIMIT = (20, 31)  # 20 messages per 31 seconds
     MODE_MESSAGES = {'This room is now in subscribers-only mode.': (ChatMode.sub, True),
                      'This room is no longer in subscribers-only mode.': (ChatMode.sub, False),
@@ -93,58 +60,47 @@ class TwitchIRCBot:
         self.irc_socket = None
         self.irc = None
         self.log = log
-        self.users = {}
-        self.users_lock = threading.RLock()
-        self.followers = set()
-        self.follower_display_names = set()
-        self.first_followers = True
         self.message_time_history = []
         self.message_queue = queue.Queue()
-        self.message_queue_thread = threading.Thread(target=self.__start_message_queue, daemon=True)
-        self.message_queue_running = False
+        self.message_queue_thread = threading.Thread(target=self._start_message_queue)
+        self.running = False
         self.chat_mode = ChatMode.normal
         self.slow_time = 0
         self.hosting = None
-
-        self.users_thread = threading.Thread(target=self.__get_users, daemon=True)
-        self.followers_thread = threading.Thread(target=self.__get_followers, daemon=True)
 
         if log:
             self.log = open(log, 'ab')
 
         self.message_queue_thread.start()
-        self.users_thread.start()
-        self.followers_thread.start()
 
     @staticmethod
-    def chat_command(command, user_level=ChatUserLevel.owner):
+    def chat_command(command, badges=Badges.broadcaster):
         """Decorator for subclass chat commands.
             Call function if chat message starts with 'command' and user has appropriate user level"""
         def decorator(func):
             @functools.wraps(func)
             def wrap(*args):
                 func(*args)
-            TwitchIRCBot.commands[command] = (wrap, user_level)
+            TwitchIRCBot.commands[command] = (wrap, badges)
             return wrap
         return decorator
 
     @staticmethod
-    def regex_command(command, user_level=ChatUserLevel.owner):
+    def regex_command(command, badges=Badges.broadcaster):
         """Decorator for subclass regex commands.
             Call function if chat message contains match for 'command' regex and user has appropriate user level
-            Messages passed to regex are all lowercase"""
+        """
         def decorator(func):
             @functools.wraps(func)
             def wrap(*args):
                 func(*args)
-            TwitchIRCBot.regex_commands.append((re.compile(command), wrap, user_level))
+            TwitchIRCBot.regex_commands.append((re.compile(command), wrap, badges))
             return wrap
         return decorator
 
-    def __start_message_queue(self):
+    def _start_message_queue(self):
         """Message queue to send to IRC. Used to manage message rate to avoid bans and logging."""
-        self.message_queue_running = True
-        while self.message_queue_running:
+        while self.running:
             message = self.message_queue.get()
             if message:
                 while len(self.message_time_history) > TwitchIRCBot.MESSAGE_LIMIT[0]:
@@ -156,7 +112,7 @@ class TwitchIRCBot:
                     min_time = min(self.message_time_history)
                     time.sleep((min_time + TwitchIRCBot.MESSAGE_LIMIT[1] - current_time) + .1)
 
-            while True:
+            while self.running:
                 try:
                     self.irc.send(message)
                     if self.log:
@@ -168,11 +124,12 @@ class TwitchIRCBot:
                         self.log.flush()
                         self.message_time_history.append(time.time())
                     break
-                except Exception :
-                    self.__reconnect()
+                except Exception as e:
+                    print(e, file=sys.stderr)
+                    self._reconnect()
             self.message_queue.task_done()
 
-    def __reconnect(self):
+    def _reconnect(self):
         attempt = 0
         self.irc = None
         self.irc_socket = None
@@ -180,11 +137,10 @@ class TwitchIRCBot:
             if attempt > 0:
                 time.sleep(5)
                 print('{}: Connection failed...trying again in 5 seconds.'.format(attempt))
-            self.__connect()
+            self._connect()
             attempt += 1
 
-    def __connect(self):
-        self.users.clear()
+    def _connect(self):
         self.irc = None
         self.irc_socket = None
         irc = None
@@ -199,50 +155,22 @@ class TwitchIRCBot:
         self.irc_socket = irc
         self.irc = self.ssl_context.wrap_socket(self.irc_socket, server_hostname=TwitchIRCBot.CHAT_SERVER_HOSTNAME)
         if self.irc:
-            self.send_message('pass {}'.format(self.password))
-            self.send_message('nick {}'.format(self.user))
-            self.send_message('user {}'.format(self.user))
-            self.send_message('CAP REQ :twitch.tv/membership')
-            self.send_message('CAP REQ :twitch.tv/commands')
-            self.send_message('CAP REQ :twitch.tv/tags')
-            self.send_message('join {}'.format(self.channel))
+            self.irc.send(b'CAP REQ :twitch.tv/tags twitch.tv/commands twitch.tv/membership\r\n')
+            self.irc.send(f'pass {self.password}\r\n'.encode('utf-8'))
+            self.irc.send(f'nick {self.user}\r\n'.encode('utf-8'))
+            self.irc.send(f'user {self.user} 8 * :{self.user}\r\n'.encode('utf-8'))
+            self.irc.send(f'join {self.channel}\r\n'.encode('utf-8'))
 
             print('Joined channel {}'.format(self.channel))
 
-    def __get_users(self):
-        """Thread to keep list of users up to date."""
-        while True:
-            task = get_chatters_in_channel(self.channel)
-            users = wait(task)
-            if users:
-                self.users_lock.acquire()
-                self.users = users
-                self.users_lock.release()
-            time.sleep(61)
-
-    def __get_followers(self):
-        while True:
-            task = follows.get_followers_for_channel(self.channel)
-            followers = set(wait(task))
-            if followers:
-                self.users_lock.acquire()
-                new = followers - self.followers
-                self.followers = followers
-                self.follower_display_names = {f.display_name.lower() for f in followers}
-                self.users_lock.release()
-                if not self.first_followers and new:
-                    self.on_follow(new)
-                self.first_followers = False
-
-            time.sleep(61)
-
     def run(self):
-        self.__reconnect()
-        while True:
+        self.running = True
+        self._reconnect()
+        while self.running:
             try:
                 data = self.irc.recv(2048).decode('UTF-8')
             except Exception:
-                self.__reconnect()
+                self._reconnect()
             else:
                 current_time = datetime.utcnow().strftime('%Y:%m:%d %H:%M:%S')
 
@@ -254,6 +182,10 @@ class TwitchIRCBot:
 
                 for message in messages[:-1]:
                     self._parse_message(message)
+
+    def stop(self):
+        self.running = False
+        self.message_queue_thread.join()
 
     def _on_command(self, command, data):
         command = command.lower()
@@ -326,7 +258,10 @@ class TwitchIRCBot:
                 try:
                     strings = data.split(':')
                     msg = ":".join(strings[2:])
-                    name = strings[1][0:strings[1].index('!')]
+                    ex_ind = strings[1].find('!')
+                    if ex_ind == -1:
+                        return
+                    name = strings[1][0:ex_ind]
                     strings = data.split(' ')
                     command = strings[1].lower()
 
@@ -350,45 +285,31 @@ class TwitchIRCBot:
                             if found_sub:
                                 self.on_sub(name, months)
 
-                        self.__on_message(name, tags, msg)
+                        self._on_message(name, tags, msg)
                     elif command == "join":
                         self.on_join(name, tags)
                     elif command == "part":
                         self.on_part(name, tags)
-                except Exception:
-                    pass
+                except Exception as e:
+                    traceback.print_exc(file=sys.stderr)
 
-    def get_user_level(self, name):
-        level = ChatUserLevel.none
-        self.users_lock.acquire()
-        if self.users:
-            chatters = self.users
-            if chatters:
-                if name in chatters['global_mods']:
-                    level |= ChatUserLevel.global_mod
-                if name in chatters['admins']:
-                    level |= ChatUserLevel.admin
-                if name in chatters['staff']:
-                    level |= ChatUserLevel.staff
-                if name in chatters['moderators']:
-                    level |= ChatUserLevel.mod
-                if name in chatters['viewers']:
-                    level |= ChatUserLevel.viewer
-        if self.follower_display_names:
-            if name in self.follower_display_names:
-                level |= ChatUserLevel.follower
-        if name == self.channel[1:]:
-            level |= ChatUserLevel.owner
+    @staticmethod
+    def get_badges(badges):
+        level = Badges.none
 
-        self.users_lock.release()
+        badges = [badge.split('/')[0] for badge in badges.split(',')]
+        badge_vars = vars(Badges)
+        for badge in badges:
+            level |= badge_vars.get(badge, 0)
+
         return level
 
-    def __on_message(self, name, tags, message):
-        lower_message = message.lower()
-        parts = lower_message.split()
+    def _on_message(self, name, tags, message):
+        #lower_message = message.lower()
+        parts = message.split()
         event = TwitchIRCBot.commands.get(parts[0])
-        user_level = self.get_user_level(name)
-        if event and (user_level & event[1]):
+        badges = self.get_badges(tags['badges'])
+        if event and (badges & event[1] or event[1] == Badges.none):
             try:
                 ind = message.index(' ')
             except ValueError:
@@ -399,8 +320,8 @@ class TwitchIRCBot:
                 event[0](self, name, tags, message[ind+1:])
 
         for event in TwitchIRCBot.regex_commands:
-            if user_level & event[2]:
-                matches = event[0].findall(lower_message)
+            if badges & event[2] or event[2] == Badges.none:
+                matches = [m.groupdict() for m in event[0].finditer(message)]
                 if matches:
                     event[1](self, matches, name, tags, message)
 

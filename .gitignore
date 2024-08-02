@@ -4,3 +4,4 @@ dist/
 build/
 *.spec
 *.bat
+IRCBot.py
