@@ -71,8 +71,6 @@ class TwitchIRCBot:
         if log:
             self.log = open(log, 'ab')
 
-        self.message_queue_thread.start()
-
     @staticmethod
     def chat_command(command, badges=Badges.broadcaster):
         """Decorator for subclass chat commands.
@@ -166,6 +164,7 @@ class TwitchIRCBot:
     def run(self):
         self.running = True
         self._reconnect()
+        self.message_queue_thread.start()
         while self.running:
             try:
                 data = self.irc.recv(2048).decode('UTF-8')
@@ -190,7 +189,7 @@ class TwitchIRCBot:
     def _on_command(self, command, data):
         command = command.lower()
         if command == "ping":
-            server = data[6:-1]
+            server = data[5:-1]
             self.send_message('PONG {}'.format(server))
 
     def _parse_message(self, data):
