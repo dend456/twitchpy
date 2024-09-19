@@ -62,7 +62,7 @@ class TwitchIRCBot:
         self.log = log
         self.message_time_history = []
         self.message_queue = queue.Queue()
-        self.message_queue_thread = threading.Thread(target=self._start_message_queue)
+        self.message_queue_thread = threading.Thread(target=self._start_message_queue, daemon=True)
         self.running = False
         self.chat_mode = ChatMode.normal
         self.slow_time = 0

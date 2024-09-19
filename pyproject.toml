@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "twitchpy"
-version = "0.0.2"
+version = "0.0.3"
 description = "Twitch API Library"
 readme = "README.md"
 requires-python = ">=3.6"
