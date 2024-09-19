@@ -205,7 +205,7 @@ class TwitchIRCBot:
             tag = data[:ind].split(';')
             data = data[ind+1:]
             for t in tag:
-                k, v = t.split('=')
+                k, v = t.split('=', 1)
                 tags[k] = v
 
         data = data.strip()
